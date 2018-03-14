@@ -7,7 +7,6 @@ import hashlib
 import zipfile
 import lzma
 
-
 class WavFileException(Exception):
     Wav_file_damaged = "Check arguments or your .wav file might be damaged, or doesn't exist"
 
@@ -79,7 +78,7 @@ class WavFile:
 
 
 class WavSteganography:
-    BUFFER_SIZE = 64 * 1024 ** 2
+    BUFFER_SIZE = 64 * 1024
 
     @staticmethod
     def set_bit(int_byte, bit, offset):
@@ -119,17 +118,9 @@ class WavSteganography:
         return bytes([injection_int])
 
     @staticmethod
-    def create_zip_archive(hide_data):
-        def wrapper(wav_path, *args):
-            zip_arch = zipfile.ZipFile('arch.zip', 'w', compression=zipfile.ZIP_LZMA)
-            zip_arch.write(wav_path)
-            zip_arch.close()
-            hide_data('arch.zip', *args)
-        return wrapper
-
-    @staticmethod
-    def hide_data(wav_path, file_to_hide, wav_stegano, lsb_number, wav_file):
+    def hide_data(wav_path, file_to_hide, file_name, wav_stegano, lsb_number):
         buffer_size = WavSteganography.BUFFER_SIZE
+        wav_file = WavFile(wav_path)
         with FileBuffer(wav_path, 'rb', buffer_size) as wav_file_buffer:
             with FileBuffer(file_to_hide, 'rb', buffer_size) as file_to_hide_buffer:
                 with FileBuffer(wav_stegano, 'ab', buffer_size) as wav_stegano_buffer:
@@ -137,15 +128,25 @@ class WavSteganography:
                     prefix = wav_file_buffer.read(wav_file.offset)
                     wav_stegano_buffer.write(prefix)
 
+                    # injecting lsb
                     bytes_per_sample = wav_file.header.bytes_per_sample
-                    wav_block = wav_file_buffer.read(wav_file.header.bytes_per_sample * (8 // 2))
+                    wav_block = wav_file_buffer.read(bytes_per_sample * (8 // 2))
                     lsb_byte = bytes([lsb_number])
                     stegano_data = WavSteganography.rewrite_hiding_data(wav_block,
                                                                         bytes_per_sample, lsb_byte)
                     wav_stegano_buffer.write(stegano_data)
 
+                    # injecting size of hiding file
+
                     file_to_hide_size = os.path.getsize(file_to_hide)
                     file_to_hide_buffer.write(file_to_hide_size.to_bytes(4, 'big'))
+
+                    # injecting size of file name and file name
+                    file_name_size_byte = len(file_name).to_bytes(1, 'big')
+                    file_to_hide_name_bytes = file_name.encode('utf-8')
+                    file_to_hide_buffer.write(file_name_size_byte)
+                    file_to_hide_buffer.write(file_to_hide_name_bytes)
+
                     while True:
                         hiding_data = file_to_hide_buffer.read(1)
                         if not hiding_data:
@@ -164,13 +165,13 @@ class WavSteganography:
                         wav_stegano_buffer.write(rest)
 
     @staticmethod
-    def recover_data(wav_file, file_to_find):
+    def recover_data(wav_file):
         buffer_size = WavSteganography.BUFFER_SIZE
         wav_stegano = WavFile(wav_file)
         with FileBuffer(wav_file, 'rb', buffer_size) as wav_buffer:
-            with FileBuffer(file_to_find, 'ab', buffer_size) as file_to_recover_buffer:
                 wav_buffer.file.seek(wav_stegano.offset)
 
+                # recover lsb count
                 bytes_per_sample = wav_stegano.header.bytes_per_sample
                 block_size = bytes_per_sample * (8 // 2)
                 block_lsb = wav_buffer.read(block_size)
@@ -179,6 +180,8 @@ class WavSteganography:
 
                 lsb_count = int.from_bytes(lsb_count_byte, 'big')
                 size_bytes = b''
+
+                # recover size of hidden file
                 block_size = bytes_per_sample * (8 // lsb_count)
                 while len(size_bytes) != 4:
                     wav_block = wav_buffer.read(block_size)
@@ -186,12 +189,49 @@ class WavSteganography:
                                                          bytes_per_sample,
                                                          lsb_count)
                 size = int.from_bytes(size_bytes, 'big')
-                for i in range(size):
+
+                name_size_byte = WavSteganography.eject(wav_buffer.read(block_size),
+                                                        bytes_per_sample, lsb_count)
+                # recover file name
+                name_size = int.from_bytes(name_size_byte, 'big')
+                name_buffer = b''
+                while name_size > 0:
                     wav_block = wav_buffer.read(block_size)
-                    ejection_byte = WavSteganography.eject(wav_block,
-                                                           bytes_per_sample,
-                                                           lsb_count)
-                    file_to_recover_buffer.write(ejection_byte)
+                    name_buffer += WavSteganography.eject(wav_block, bytes_per_sample,
+                                                          lsb_count)
+                    name_size -= 1
+                file_name = name_buffer.decode()
+
+                zip_path = get_file_name('arch.zip')
+
+                with FileBuffer(zip_path, 'ab', buffer_size) as file_to_recover_buffer:
+                    for i in range(size):
+                        wav_block = wav_buffer.read(block_size)
+                        ejection_byte = WavSteganography.eject(wav_block,
+                                                               bytes_per_sample,
+                                                               lsb_count)
+                        file_to_recover_buffer.write(ejection_byte)
+        with zipfile.ZipFile(zip_path, 'r', compression=zipfile.ZIP_LZMA) as z:
+            z.extract(file_name)
+        os.remove(zip_path)
+        print('File {} was recovered in this folder'.format(file_name))
+
+
+def get_file_name(file_path):
+    n = 1
+    while os.path.exists(file_path):
+        file_path = file_path.replace('.', '(' + str(n) + ').')
+        n = n + 1
+    return file_path
+
+
+def create_zip_archive(file_to_hide):
+    zip_path = 'arch.zip'
+    zip_path = get_file_name(zip_path)
+    zip_file = zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_LZMA)
+    zip_file.write(file_to_hide)
+    zip_file.close()
+    return zip_path
 
 
 def check_arguments(arguments):
@@ -203,8 +243,7 @@ def check_arguments(arguments):
                     or arguments.lsb_count is None):
                 arguments_correct = False
         elif arguments.mode == 'r':
-            if (arguments.output is None
-                    or arguments.wav_path is None):
+            if arguments.wav_path is None:
                 arguments_correct = False
         else:
             arguments_correct = False
@@ -258,7 +297,7 @@ def usage():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-mode', dest='mode',
+    parser.add_argument('-mode', dest='mode', choices=['h', 'r'],
                         help='Mode: hide or recover (h/r)')
     parser.add_argument('-s', dest='wav_path',
                         help='Path of .wav sound')
@@ -274,15 +313,18 @@ def main():
     check_arguments(arguments)
 
     if arguments.mode == 'h':
+        hash_before = blake2s_hash(arguments.wav_path)
+        zip_path = create_zip_archive(arguments.file_to_hide)
+        file_name = arguments.file_to_hide
+        arguments.file_to_hide = zip_path
         is_size_suitable(arguments)
-        wav_file = WavFile(arguments.wav_path)
-        WavSteganography.hide_data(arguments.wav_path, arguments.file_to_hide,
-                                   arguments.output, arguments.lsb_count, wav_file)
-        print('Blake2s hash of wav-file {}'.format(blake2s_hash(arguments.wav_path)))
-        print('Blake2s hash of wav-file with hidden file {}'.format(blake2s_hash(arguments.wav_path)))
+        WavSteganography.hide_data(arguments.wav_path, zip_path, file_name,
+                                   arguments.output, arguments.lsb_count)
+        os.remove(zip_path)
+        print('Blake2s hash of wav-file before hiding  \n{}'.format(hash_before))
+        print('Blake2s hash of wav-file with hidden file \n{}'.format(blake2s_hash(arguments.output)))
     elif arguments.mode == 'r':
-        WavSteganography.recover_data(arguments.wav_path,
-                                      arguments.output)
+        WavSteganography.recover_data(arguments.wav_path)
 
 
 if __name__ == "__main__":
